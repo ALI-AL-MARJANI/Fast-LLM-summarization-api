@@ -34,6 +34,8 @@ class SummarizeRequest(BaseModel):
     ]
     style: SummaryStyle = SummaryStyle.SHORT
     max_tokens: int = Field(default=256, ge=MIN_OUTPUT_TOKENS, le=MAX_OUTPUT_TOKENS)
+    # When true, the summary is returned incrementally as Server-Sent Events.
+    stream: bool = False
 
 
 class Usage(BaseModel):

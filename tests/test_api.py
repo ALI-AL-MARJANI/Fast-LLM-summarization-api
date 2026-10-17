@@ -155,3 +155,92 @@ def test_unexpected_error_does_not_leak_internals(make_client):
     response = summarize(make_client(handler), {"text": TEXT})
     assert response.status_code == 500
     assert response.json() == {"detail": "Internal server error."}
+
+
+# --- Streaming (Server-Sent Events) -------------------------------------------
+
+def sse_chunk(data: dict | str) -> bytes:
+    payload = data if isinstance(data, str) else json.dumps(data)
+    return f"data: {payload}\n\n".encode()
+
+
+USAGE = {"prompt_tokens": 120, "completion_tokens": 5}
+STREAM_BODY = b"".join([
+    sse_chunk({"model": MODEL, "choices": [{"delta": {"role": "assistant"}}], "usage": None}),
+    sse_chunk({"model": MODEL, "choices": [{"delta": {"content": "A fox"}}], "usage": None}),
+    sse_chunk({"model": MODEL, "choices": [{"delta": {"content": " jumps."}}], "usage": None}),
+    sse_chunk({"model": MODEL, "choices": [], "usage": USAGE}),
+    sse_chunk("[DONE]"),
+])
+
+
+class FailingStream(httpx.AsyncByteStream):
+    """Sends one token, then times out: simulates vLLM stalling mid-generation."""
+
+    async def __aiter__(self):
+        yield sse_chunk({"model": MODEL, "choices": [{"delta": {"content": "A fox"}}]})
+        raise httpx.ReadTimeout("Read timed out")
+
+
+def parse_sse(body: str) -> list[tuple[str, dict]]:
+    events = []
+    for block in body.strip().split("\n\n"):
+        lines = dict(line.split(": ", 1) for line in block.splitlines())
+        events.append((lines["event"], json.loads(lines["data"])))
+    return events
+
+
+def test_stream_happy_path(make_client):
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(
+            200, content=STREAM_BODY, headers={"Content-Type": "text/event-stream"}
+        )
+
+    response = summarize(make_client(handler), {"text": TEXT, "stream": True})
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert captured[0]["stream"] is True
+    assert captured[0]["stream_options"] == {"include_usage": True}
+
+    events = parse_sse(response.text)
+    assert events[:2] == [("delta", {"text": "A fox"}), ("delta", {"text": " jumps."})]
+    name, done = events[2]
+    assert name == "done"
+    assert done["model"] == MODEL
+    assert done["usage"] == {"prompt_tokens": 120, "completion_tokens": 5, "total_tokens": 125}
+
+
+def test_stream_vllm_down_returns_503_before_streaming(make_client):
+    response = summarize(make_client(vllm_down), {"text": TEXT, "stream": True})
+    assert response.status_code == 503
+
+
+def test_stream_upstream_http_error_is_mapped(make_client):
+    client = make_client(lambda r: httpx.Response(400))
+    response = summarize(client, {"text": TEXT, "stream": True})
+    assert response.status_code == 502
+
+
+def test_stream_mid_generation_timeout_emits_error_event(make_client):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=FailingStream())
+
+    response = summarize(make_client(handler), {"text": TEXT, "stream": True})
+    assert response.status_code == 200  # headers were already sent
+    assert parse_sse(response.text) == [
+        ("delta", {"text": "A fox"}),
+        ("error", {"detail": "vLLM did not respond in time."}),
+    ]
+
+
+def test_stream_without_usage_emits_error_event(make_client):
+    body = b"".join([
+        sse_chunk({"model": MODEL, "choices": [{"delta": {"content": "Hi"}}]}),
+        sse_chunk("[DONE]"),
+    ])
+    client = make_client(lambda r: httpx.Response(200, content=body))
+    response = summarize(client, {"text": TEXT, "stream": True})
+    assert parse_sse(response.text)[-1][0] == "error"

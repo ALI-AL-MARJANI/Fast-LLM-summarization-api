@@ -8,15 +8,17 @@ import logging
 import secrets
 import time
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 
 from app.config import Settings
 from app.llm_client import (
+    Completion,
     LLMError,
     LLMResponseError,
     LLMTimeoutError,
@@ -50,6 +52,53 @@ def require_api_key(request: Request, api_key: str | None = Security(api_key_hea
             detail="Missing or invalid API key.",
             headers={"WWW-Authenticate": "APIKey"},
         )
+
+
+def elapsed_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 1)
+
+
+def usage_of(completion: Completion) -> Usage:
+    return Usage(
+        prompt_tokens=completion.prompt_tokens,
+        completion_tokens=completion.completion_tokens,
+        total_tokens=completion.prompt_tokens + completion.completion_tokens,
+    )
+
+
+def sse(event: str, data: dict) -> str:
+    """Format one Server-Sent Event (`event:` line, `data:` line, blank line)."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def stream_summary(
+    llm: VLLMClient, upstream: httpx.Response, request_id: str, start: float
+) -> AsyncIterator[str]:
+    """Re-emit vLLM's token stream as gateway events: `delta`*, then `done` or `error`."""
+    try:
+        async for item in llm.iter_stream(upstream):
+            if isinstance(item, str):
+                yield sse("delta", {"text": item})
+                continue
+            latency_ms = elapsed_ms(start)
+            # The access-log line is written when headers are sent, before the
+            # body; token counts are only known here, at the end of the stream.
+            logger.info(json.dumps({
+                "request_id": request_id,
+                "event": "stream_complete",
+                "latency_ms": latency_ms,
+                "prompt_tokens": item.prompt_tokens,
+                "completion_tokens": item.completion_tokens,
+            }))
+            yield sse("done", {
+                "model": item.model,
+                "usage": usage_of(item).model_dump(),
+                "latency_ms": latency_ms,
+            })
+    except LLMError as exc:
+        # The 200 status line is already sent: report the failure in-band.
+        logger.warning(json.dumps({"request_id": request_id, "error": str(exc)}))
+        yield sse("error", {"detail": str(exc)})
 
 
 def create_app(
@@ -94,7 +143,7 @@ def create_app(
                 "method": request.method,
                 "path": request.url.path,
                 "status": status_code,
-                "latency_ms": round((time.perf_counter() - start) * 1000, 1),
+                "latency_ms": elapsed_ms(start),
                 **request.state.log_extra,
             }
             logger.info(json.dumps(record))
@@ -125,15 +174,27 @@ def create_app(
     @app.post(
         "/v1/summarize",
         response_model=SummarizeResponse,
+        responses={200: {"content": {"text/event-stream": {}}}},
         dependencies=[Depends(require_api_key)],
     )
     async def summarize(
         body: SummarizeRequest, request: Request, llm: VLLMClient = Depends(get_llm)
-    ) -> SummarizeResponse:
+    ) -> SummarizeResponse | StreamingResponse:
         request.state.log_extra["input_chars"] = len(body.text)
+        messages = build_messages(body.text, body.style)
         start = time.perf_counter()
-        completion = await llm.chat(build_messages(body.text, body.style), body.max_tokens)
-        latency_ms = round((time.perf_counter() - start) * 1000, 1)
+
+        if body.stream:
+            # Upstream errors raised here still produce a normal 503/504/502.
+            upstream = await llm.open_stream(messages, body.max_tokens)
+            return StreamingResponse(
+                stream_summary(llm, upstream, request.state.request_id, start),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
+
+        completion = await llm.chat(messages, body.max_tokens)
+        latency_ms = elapsed_ms(start)
         request.state.log_extra.update(
             prompt_tokens=completion.prompt_tokens,
             completion_tokens=completion.completion_tokens,
@@ -141,11 +202,7 @@ def create_app(
         return SummarizeResponse(
             summary=completion.text,
             model=completion.model,
-            usage=Usage(
-                prompt_tokens=completion.prompt_tokens,
-                completion_tokens=completion.completion_tokens,
-                total_tokens=completion.prompt_tokens + completion.completion_tokens,
-            ),
+            usage=usage_of(completion),
             latency_ms=latency_ms,
         )
 
