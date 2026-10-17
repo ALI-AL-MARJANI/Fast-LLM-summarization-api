@@ -1,0 +1,65 @@
+# Two services on a private Docker network:
+#   - vllm:    model server, GPU, NOT published on the host (internal only)
+#   - gateway: FastAPI, the only service reachable from outside (port 8080)
+#
+# On EC2 (GPU):    docker compose up -d
+# On a laptop:     docker compose up --build --no-deps gateway   (no vLLM)
+
+services:
+  vllm:
+    # Pinned version: vLLM flags and defaults change quickly between releases.
+    image: vllm/vllm-openai:v0.31.0
+    command:
+      - --model=${MODEL_NAME:-Qwen/Qwen3-4B-Instruct-2507}
+      # T4 (Turing, sm_75) has no bfloat16 support; the checkpoint is bf16,
+      # so we cast the weights to fp16 explicitly.
+      - --dtype=half
+      # Context window per sequence. Bounds the KV-cache a single request can
+      # claim; 8192 covers our 20k-character input limit + 512 output tokens.
+      - --max-model-len=8192
+      # Fraction of VRAM vLLM pre-allocates (weights + activations + KV-cache).
+      - --gpu-memory-utilization=0.90
+      - --host=0.0.0.0
+      - --port=8000
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      # Weights are downloaded once and survive container restarts.
+      - hf-cache:/root/.cache/huggingface
+    # PyTorch uses shared memory; the vLLM docs recommend host IPC in Docker.
+    ipc: host
+    # Note: no `ports:` section. vLLM is reachable only as http://vllm:8000
+    # from other containers of this compose project.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # First start = download (~8 GB) + weight loading + CUDA graph capture.
+      # Failed checks during this window do not count against `retries`.
+      start_period: 15m
+    restart: unless-stopped
+
+  gateway:
+    build: ./gateway
+    env_file: .env
+    environment:
+      # Always target the internal service name, whatever `.env` says.
+      VLLM_BASE_URL: http://vllm:8000
+    ports:
+      - "8080:8080"
+    depends_on:
+      vllm:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
