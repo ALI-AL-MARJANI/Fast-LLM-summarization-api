@@ -1,0 +1,31 @@
+# --- Secrets: never commit these -------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Local artifacts ----------------------------------------------------------
+# Hugging Face cache, in case it is ever mounted inside the project directory.
+.cache/
+hf_cache/
+# Raw benchmark dumps; only the curated Markdown table goes into the README.
+benchmark_results/
+
+# --- Editors / OS -------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
