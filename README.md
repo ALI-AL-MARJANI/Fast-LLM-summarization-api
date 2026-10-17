@@ -62,8 +62,8 @@ The tests mock vLLM at the HTTP transport level (`httpx.MockTransport`), so the 
 
 ```bash
 uv venv --python 3.12 .venv && source .venv/bin/activate
-uv pip install -r gateway/requirements.txt pytest==9.1.1
-PYTHONPATH=gateway pytest tests -q
+uv pip install -r requirements-dev.txt
+pytest
 ```
 
 ### Run the gateway locally with Docker (without vLLM)
@@ -89,6 +89,7 @@ Interactive OpenAPI docs: `http://<host>:8080/docs`.
 | `text` | string | 20 – 20,000 characters (after trimming) | required |
 | `style` | string | `short`, `detailed`, `bullet_points` | `short` |
 | `max_tokens` | integer | 32 – 512 | 256 |
+| `stream` | boolean | stream the summary as Server-Sent Events | `false` |
 
 ```bash
 curl -s http://<host>:8080/v1/summarize \
@@ -105,6 +106,29 @@ curl -s http://<host>:8080/v1/summarize \
 }
 ```
 
+### Streaming (`"stream": true`)
+
+The response is a `text/event-stream` of Server-Sent Events: one `delta` event per chunk of generated text, then a final `done` event with the usage, or an `error` event if vLLM fails mid-generation.
+
+```bash
+curl -sN http://<host>:8080/v1/summarize \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"text": "Heat pumps move heat instead of producing it. ...", "stream": true}'
+```
+
+```text
+event: delta
+data: {"text": "Heat"}
+
+event: delta
+data: {"text": " pumps"}
+
+event: done
+data: {"model": "Qwen/Qwen3-4B-Instruct-2507", "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, "latency_ms": 0.0}
+```
+
+Failures that happen before the first byte (vLLM down, rejected request) still return a regular 503/502/504 status. Once streaming has started, the `200` status line has already been sent, so a failure is reported as an `error` event instead. If the client disconnects, the gateway closes its upstream connection to vLLM, which lets vLLM abort the generation instead of spending GPU time on it.
+
 ### `GET /health` (public)
 
 Readiness probe: returns `200 {"status": "ok", "vllm": "ready"}` only if vLLM answers its own `/health`, and `503` otherwise (for example while the model is loading).
@@ -120,7 +144,7 @@ Readiness probe: returns `200 {"status": "ok", "vllm": "ready"}` only if vLLM an
 | 504 | vLLM did not answer within `VLLM_REQUEST_TIMEOUT_S` |
 | 500 | Unexpected error; details are logged server-side only |
 
-Every response carries an `X-Request-ID` header, which matches the gateway's JSON log line for that request (method, path, status, latency, input length, token counts).
+Every response carries an `X-Request-ID` header, which matches the gateway's JSON log line for that request (method, path, status, latency, input length, token counts). For streamed responses, token counts and total latency go into a second `stream_complete` line with the same request id, written when the stream ends.
 
 ## Benchmark results
 
@@ -179,7 +203,6 @@ The instance only runs while it is in use: **stop** it between sessions (GPU bil
 - CI with GitHub Actions (tests and image build on every push).
 - A metrics endpoint (request counts, latency histograms, vLLM queue depth).
 - Quantized model comparison: `Qwen/Qwen2.5-7B-Instruct-AWQ` vs the 4B fp16 model on the same T4 (latency, throughput, summary quality).
-- Streaming responses (Server-Sent Events).
 - Autoscaling across several GPU instances.
 
 ## Repository layout
@@ -187,14 +210,17 @@ The instance only runs while it is in use: **stop** it between sessions (GPU bil
 ```
 ├── docker-compose.yml     # vLLM (GPU, internal) + gateway (public :8080)
 ├── .env.example           # configuration template (copy to .env)
+├── pytest.ini             # test discovery and import path
+├── requirements-dev.txt   # gateway dependencies + pytest
 ├── gateway/
 │   ├── Dockerfile
+│   ├── .dockerignore
 │   ├── requirements.txt
 │   └── app/
 │       ├── main.py        # app factory, auth, error mapping, logging, routes
 │       ├── config.py      # settings from environment (pydantic-settings)
 │       ├── schemas.py     # request/response models and input bounds
-│       ├── llm_client.py  # async client for vLLM's OpenAI-compatible API
+│       ├── llm_client.py  # async client for vLLM's OpenAI-compatible API (incl. streaming)
 │       └── prompts.py     # summarization prompt templates
 ├── tests/test_api.py      # pytest, mocked vLLM backend
 ├── scripts/benchmark.py   # async load test, Markdown output
