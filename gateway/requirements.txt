@@ -1,0 +1,6 @@
+# Runtime dependencies of the gateway. Pinned for reproducible builds.
+fastapi==0.143.3
+uvicorn==0.54.0
+pydantic==2.14.1
+pydantic-settings==2.16.0
+httpx==0.28.1
