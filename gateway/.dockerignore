@@ -1,0 +1,10 @@
+# Keep the build context minimal: only requirements.txt and app/ are needed.
+# `**/` is required to match at any depth (patterns are anchored to the root).
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.env
+**/.env.*
+**/*.pem
+Dockerfile
+.dockerignore
