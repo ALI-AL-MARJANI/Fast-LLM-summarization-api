@@ -177,7 +177,7 @@ Setup: AWS `g4dn.xlarge` (1× NVIDIA T4 16 GB, 4 vCPU, 16 GiB RAM), `eu-north-1`
 | EBS gp3 root volume (100 GiB) | billed per GB-month, **also while the instance is stopped** |
 | Total spent on this project | `<TODO: from the AWS billing page at the end of the project>` |
 
-The instance only runs while it is in use: **stop** it between sessions (GPU billing stops, only the EBS volume is billed) and **terminate** it at the end (the volume is deleted too). See the [teardown checklist](docs/aws-setup.md#10-stop-vs-terminate-and-teardown).
+The instance only runs while it is in use: **stop** it between sessions (GPU billing stops, only the EBS volume is billed) and **terminate** it at the end (the volume is deleted too). See the [teardown checklist](docs/aws-setup.md#9-stop-vs-terminate-and-teardown).
 
 ## Security notes
 
