@@ -1,0 +1,83 @@
+# CPU variant of the stack (no GPU required). Same two services as
+# docker-compose.yml; only the engine under vLLM changes.
+#   - vllm:    model server on the CPU backend, NOT published on the host
+#   - gateway: FastAPI, the only service reachable from outside (port 8080)
+#
+# Target: AWS m7i.xlarge (4 vCPU = 2 physical cores, 16 GB RAM, AVX-512 + AMX).
+#   docker compose -f docker-compose.cpu.yml up -d
+#
+# Standalone file rather than an override of docker-compose.yml: an override
+# would have to remove the NVIDIA device reservation, which Compose can only do
+# with the `!reset` tag. One self-contained file is easier to read and to run.
+
+services:
+  vllm:
+    # Official prebuilt CPU image, same vLLM version as the GPU stack.
+    # Multi-arch tag: amd64 on EC2, arm64 on Apple Silicon for local tests.
+    image: vllm/vllm-openai-cpu:v0.31.0
+    command:
+      - --model=${MODEL_NAME:-Qwen/Qwen2.5-1.5B-Instruct}
+      # Recommended on CPU (fp16 is unstable in torch CPU). Sapphire Rapids
+      # runs bf16 matrix multiplications natively on its AMX units, and the
+      # checkpoint is already bf16, so no conversion happens at load time.
+      - --dtype=${VLLM_CPU_DTYPE:-bfloat16}
+      # Same context window as the GPU stack, matching the gateway input limits.
+      - --max-model-len=8192
+      - --host=0.0.0.0
+      - --port=8000
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      # KV-cache size in GiB. Without it, vLLM sizes the cache from
+      # --gpu-memory-utilization, which on CPU means a fraction of host RAM.
+      # 4 GiB holds ~150k tokens for Qwen2.5-1.5B (28 KiB per token).
+      VLLM_CPU_KVCACHE_SPACE: ${VLLM_CPU_KVCACHE_SPACE:-4}
+      # `auto` binds one OpenMP thread per physical core (hyperthreads are
+      # skipped) and, by default, reserves one core for the scheduler process.
+      # With only 2 physical cores that would leave a single compute core, so
+      # we reserve none: the scheduler and the gateway run on the idle
+      # hyperthread siblings. vLLM logs a warning about this; it is expected.
+      VLLM_CPU_OMP_THREADS_BIND: auto
+      VLLM_CPU_NUM_OF_RESERVED_CPU: "0"
+    volumes:
+      # Weights are downloaded once and survive container restarts.
+      - hf-cache:/root/.cache/huggingface
+    # Shared memory for the engine processes, as in the official docker run.
+    shm_size: 4gb
+    # Allow the NUMA memory-policy syscalls vLLM uses (official recommendation,
+    # less privileged than --privileged). Acceptable here: the container is not
+    # published on the host and runs the official image.
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp=unconfined
+    # Note: no `ports:` section. vLLM is reachable only as http://vllm:8000
+    # from other containers of this compose project.
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # First start = download (~3 GB) + weight loading + torch.compile on
+      # 2 cores. Failed checks during this window do not count against `retries`.
+      start_period: 20m
+    restart: unless-stopped
+
+  gateway:
+    build: ./gateway
+    env_file: .env
+    environment:
+      # Always target the internal service name, whatever `.env` says.
+      VLLM_BASE_URL: http://vllm:8000
+      # Same interpolation as the vllm service, so the gateway always requests
+      # the model that vLLM actually serves (even if `.env` omits MODEL_NAME).
+      MODEL_NAME: ${MODEL_NAME:-Qwen/Qwen2.5-1.5B-Instruct}
+    ports:
+      - "8080:8080"
+    depends_on:
+      vllm:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
